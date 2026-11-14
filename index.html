@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Ambient test transfer</title>
+<script src="./bundle.js"></script>
+<style>
+  body { margin: 0; background: #0b0e14; color: #e6e9ef; font-family: system-ui, -apple-system, sans-serif; }
+  main { max-width: 560px; margin: 0 auto; padding: 20px 16px 40px; }
+  h1 { font-size: 22px; margin: 8px 0; }
+  h2 { font-size: 16px; margin: 24px 0 8px; }
+  p, div { font-size: 15px; line-height: 1.5; }
+  code { word-break: break-all; font-size: 13px; }
+  button { display: block; width: 100%; padding: 14px; margin: 10px 0; font-size: 16px; border: 0; border-radius: 10px; background: #2f6fed; color: #fff; }
+  button:disabled { background: #3a4152; color: #9aa3b2; }
+  input { display: block; width: 100%; box-sizing: border-box; padding: 12px; margin: 6px 0 12px; font-size: 15px; border-radius: 8px; border: 1px solid #333c4d; background: #141927; color: #e6e9ef; }
+  label { font-size: 14px; color: #b9c0cd; }
+  #status { background: #141927; border: 1px solid #2a3348; border-radius: 10px; padding: 12px; min-height: 20px; }
+  #status.err { border-color: #c0392b; }
+  .card { background: #141927; border: 1px solid #2a3348; border-radius: 10px; padding: 12px; margin: 10px 0; }
+  .note { font-size: 13px; color: #9aa3b2; }
+  .warn { color: #f5b301; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Ambient test transfer</h1>
+  <p>Send a tiny test amount of test AMB on the Ambient testnet. Your key never leaves Phantom. Signing happens only inside Phantom.</p>
+  <div id="status">Loading…</div>
+
+  <h2>1. Connect wallet</h2>
+  <button id="connectBtn">Connect Phantom</button>
+  <div id="walletInfo"></div>
+
+  <h2>2. Transfer</h2>
+  <label>To address
+    <input id="toInput" value="48kk5Ao3kFA8E77xYVm487xTa63kQP4BaevNrdkZnhC7" autocomplete="off" spellcheck="false">
+  </label>
+  <label>Amount (AMB, max 0.1)
+    <input id="amountInput" type="number" value="0.001" min="0.000001" max="0.1" step="0.000001">
+  </label>
+  <div id="txSummary" class="card">From: —<br>To: —<br>Amount: —</div>
+  <button id="sendBtn" disabled>Sign &amp; send</button>
+
+  <h2>3. Result</h2>
+  <div id="result" class="card">Nothing sent yet.</div>
+
+  <p class="note">Safety: this page never asks for your seed phrase or private key. Test amount is capped at 0.1 AMB. Chain: Ambient testnet (rpc.ambient.xyz). Easiest path: open this page inside your Phantom app's browser. From a normal browser, Connect opens the Phantom app instead.</p>
+</main>
+<script>
+(function () {
+  'use strict';
+
+  var RPC_URL = 'https://rpc.ambient.xyz';
+  var EXPECTED_FROM = '4pvJD4agHwNG894XNbGp6wxqtT7jt4fwfq9gMttFzjWm';
+  var EXPECTED_TO = '48kk5Ao3kFA8E77xYVm487xTa63kQP4BaevNrdkZnhC7';
+  var MAX_AMB = 0.1;
+  var LAMPORTS_PER_AMB = 1000000000;
+
+  function $(id) { return document.getElementById(id); }
+  function setStatus(msg, isErr) {
+    var el = $('status');
+    el.textContent = msg;
+    el.className = isErr ? 'err' : '';
+  }
+
+  // ---------- base58 ----------
+  var B58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+  function b58encode(bytes) {
+    if (bytes.length === 0) return '';
+    var zeroes = 0;
+    while (zeroes < bytes.length && bytes[zeroes] === 0) zeroes++;
+    var digits = [];
+    for (var i = 0; i < bytes.length; i++) {
+      var carry = bytes[i];
+      for (var j = 0; j < digits.length; j++) {
+        carry += digits[j] << 8;
+        digits[j] = carry % 58;
+        carry = (carry / 58) | 0;
+      }
+      while (carry > 0) { digits.push(carry % 58); carry = (carry / 58) | 0; }
+    }
+    var str = '';
+    for (var k = 0; k < zeroes; k++) str += '1';
+    for (var m = digits.length - 1; m >= 0; m--) str += B58_ALPHABET[digits[m]];
+    return str;
+  }
+  function b58decode(str) {
+    if (str.length === 0) return new Uint8Array(0);
+    var zeroes = 0;
+    while (zeroes < str.length && str[zeroes] === '1') zeroes++;
+    var bytes = [];
+    for (var i = 0; i < str.length; i++) {
+      var value = B58_ALPHABET.indexOf(str[i]);
+      if (value < 0) throw new Error('Invalid base58 character');
+      var carry = value;
+      for (var j = 0; j < bytes.length; j++) {
+        carry += bytes[j] * 58;
+        bytes[j] = carry & 0xff;
+        carry >>= 8;
+      }
+      while (carry > 0) { bytes.push(carry & 0xff); carry >>= 8; }
+    }
+    var out = new Uint8Array(zeroes + bytes.length);
+    for (var n = 0; n < bytes.length; n++) out[zeroes + n] = bytes[bytes.length - 1 - n];
+    return out;
+  }
+
+  // ---------- state ----------
+  var connection = null;
+  var fromPubkey = null;
+  var injectedProvider = null;
+  var dlSession = null; // { sharedSecret, session }
+
+  function pageUrl() { return window.location.origin + window.location.pathname; }
+
+  function updateSendState() {
+    $('sendBtn').disabled = !fromPubkey;
+    var to = $('toInput').value.trim();
+    var amt = parseFloat($('amountInput').value);
+    $('txSummary').innerHTML =
+      'From: ' + (fromPubkey ? '<code>' + fromPubkey.toBase58() + '</code>' : '—') +
+      '<br>To: ' + (to ? '<code>' + to + '</code>' : '—') +
+      '<br>Amount: ' + (isFinite(amt) ? amt + ' AMB (' + Math.round(amt * LAMPORTS_PER_AMB).toLocaleString() + ' lamports)' : '—');
+  }
+
+  function storeDappKeys(dappKeyPair) {
+    sessionStorage.setItem('amb_dapp_sk', b58encode(dappKeyPair.secretKey));
+  }
+  function loadDappKeyPair() {
+    var sk = sessionStorage.getItem('amb_dapp_sk');
+    if (!sk) return null;
+    return nacl.box.keyPair.fromSecretKey(b58decode(sk));
+  }
+
+  // ---------- connect ----------
+  async function onConnect() {
+    setStatus('Connecting…');
+    try {
+      if (window.solana && window.solana.isPhantom) {
+        injectedProvider = window.solana;
+        var res = await injectedProvider.connect();
+        fromPubkey = res.publicKey;
+        await afterConnect('Phantom');
+        return;
+      }
+      // Deeplink fallback (normal mobile browser -> Phantom app).
+      var dappKeyPair = nacl.box.keyPair();
+      storeDappKeys(dappKeyPair);
+      sessionStorage.setItem('amb_flow', 'connect');
+      var url = 'https://phantom.app/ul/v1/connect?' + new URLSearchParams({
+        dapp_encryption_public_key: b58encode(dappKeyPair.publicKey),
+        cluster: 'mainnet-beta',
+        app_url: window.location.origin,
+        redirect_link: pageUrl()
+      }).toString();
+      window.location.href = url;
+    } catch (e) {
+      setStatus('Connect failed: ' + (e && e.message ? e.message : e), true);
+    }
+  }
+
+  async function afterConnect(how) {
+    var addr = fromPubkey.toBase58();
+    var matchFrom = addr === EXPECTED_FROM;
+    $('walletInfo').innerHTML =
+      '<div class="card">Connected (' + how + '):<br><code>' + addr + '</code><br>' +
+      (matchFrom ? 'This matches your main wallet.' : '<span class="warn">Warning: this is not your main wallet (expected ' + EXPECTED_FROM + '). Check before sending.</span>') +
+      '<br><span id="balance">Checking balance…</span></div>';
+    try {
+      var bal = await connection.getBalance(fromPubkey);
+      var el = $('balance');
+      if (el) el.textContent = 'Balance: ' + (bal / LAMPORTS_PER_AMB).toFixed(4) + ' AMB (testnet)';
+      setStatus('Ready. Enter the destination and amount, then sign.');
+    } catch (e) {
+      var el2 = $('balance');
+      if (el2) el2.textContent = 'Could not read balance: ' + e.message;
+      setStatus('Connected, but the balance check failed. You can still try to send.', true);
+    }
+    updateSendState();
+  }
+
+  // ---------- send ----------
+  async function onSend() {
+    var toStr = $('toInput').value.trim();
+    var amountAmb = parseFloat($('amountInput').value);
+    if (!toStr) { setStatus('Enter the destination wallet address.', true); return; }
+    var toPubkey;
+    try { toPubkey = new solanaWeb3.PublicKey(toStr); }
+    catch (e) { setStatus('Destination address is not valid.', true); return; }
+    if (toStr !== EXPECTED_TO) {
+      setStatus('Destination is not the fresh wallet (expected ' + EXPECTED_TO + '). Check it before signing.', true);
+      return;
+    }
+    if (!isFinite(amountAmb) || amountAmb <= 0 || amountAmb > MAX_AMB) {
+      setStatus('Amount must be more than 0 and at most ' + MAX_AMB + ' AMB.', true);
+      return;
+    }
+    var lamports = Math.round(amountAmb * LAMPORTS_PER_AMB);
+    setStatus('Building the transaction…');
+    try {
+      var latest = await connection.getLatestBlockhash('confirmed');
+      var tx = new solanaWeb3.Transaction({
+        feePayer: fromPubkey,
+        blockhash: latest.blockhash,
+        lastValidBlockHeight: latest.lastValidBlockHeight
+      });
+      tx.add(solanaWeb3.SystemProgram.transfer({ fromPubkey: fromPubkey, toPubkey: toPubkey, lamports: lamports }));
+      $('txSummary').innerHTML =
+        'From: <code>' + fromPubkey.toBase58() + '</code><br>' +
+        'To: <code>' + toStr + '</code><br>' +
+        'Amount: ' + amountAmb + ' AMB (' + lamports.toLocaleString() + ' lamports). Fee is about 0.000005 AMB.';
+      if (injectedProvider) {
+        setStatus('Waiting for your signature in Phantom…');
+        var signed = await injectedProvider.signTransaction(tx);
+        await broadcastSigned(signed, latest.blockhash, latest.lastValidBlockHeight);
+      } else if (dlSession) {
+        var serialized = tx.serialize({ requireAllSignatures: false });
+        var payloadObj = { session: dlSession.session, transaction: b58encode(serialized) };
+        var nonce = nacl.randomBytes(24);
+        var phantomPk = b58decode(sessionStorage.getItem('amb_phantom_pk'));
+        var dappKp = loadDappKeyPair();
+        var encrypted = nacl.box(
+          new TextEncoder().encode(JSON.stringify(payloadObj)),
+          nonce, phantomPk, dappKp.secretKey
+        );
+        sessionStorage.setItem('amb_flow', 'sign');
+        sessionStorage.setItem('amb_pending', JSON.stringify({
+          to: toStr, lamports: lamports,
+          blockhash: latest.blockhash, lastValidBlockHeight: latest.lastValidBlockHeight
+        }));
+        var url = 'https://phantom.app/ul/v1/signTransaction?' + new URLSearchParams({
+          dapp_encryption_public_key: b58encode(dappKp.publicKey),
+          nonce: b58encode(nonce),
+          redirect_link: pageUrl(),
+          payload: b58encode(encrypted)
+        }).toString();
+        window.location.href = url;
+      } else {
+        setStatus('No wallet connected.', true);
+      }
+    } catch (e) {
+      setStatus('Could not send: ' + (e && e.message ? e.message : e), true);
+    }
+  }
+
+  async function broadcastSigned(signedTx, blockhash, lastValidBlockHeight) {
+    setStatus('Signature received. Sending to the Ambient testnet…');
+    try {
+      var raw = signedTx.serialize();
+      var sig = await connection.sendRawTransaction(raw, { skipPreflight: false });
+      $('result').innerHTML = 'Sent. Signature:<br><code>' + sig + '</code><br>Waiting for confirmation…';
+      var conf = await connection.confirmTransaction(
+        { signature: sig, blockhash: blockhash, lastValidBlockHeight: lastValidBlockHeight }, 'confirmed');
+      if (conf.value && conf.value.err) {
+        $('result').innerHTML = 'Transaction failed on-chain: <code>' + JSON.stringify(conf.value.err) + '</code><br>Signature:<br><code>' + sig + '</code>';
+        setStatus('The transaction was sent but failed on-chain.', true);
+      } else {
+        $('result').innerHTML = 'Confirmed.<br>Signature:<br><code>' + sig + '</code><br>Send this signature to Mini so it can be verified on-chain.';
+        setStatus('Done. Transfer confirmed on the Ambient testnet.');
+      }
+      try {
+        var bal = await connection.getBalance(fromPubkey);
+        var el = $('balance');
+        if (el) el.textContent = 'Balance: ' + (bal / LAMPORTS_PER_AMB).toFixed(4) + ' AMB (testnet)';
+      } catch (e) { /* ignore */ }
+    } catch (e) {
+      setStatus('Broadcast failed: ' + (e && e.message ? e.message : e), true);
+    }
+  }
+
+  // ---------- deeplink return ----------
+  async function handleDeeplinkReturn(params) {
+    var flow = sessionStorage.getItem('amb_flow');
+    var dappKp = loadDappKeyPair();
+    if (!dappKp) { setStatus('Session expired. Please connect again.', true); return; }
+    try {
+      var phantomPk = b58decode(params.get('phantom_encryption_public_key'));
+      var nonce = b58decode(params.get('nonce'));
+      var data = b58decode(params.get('data'));
+      var opened = nacl.box.open(data, nonce, phantomPk, dappKp.secretKey);
+      if (!opened) { setStatus('Could not decrypt the Phantom response. Please try again.', true); return; }
+      var payload = JSON.parse(new TextDecoder().decode(opened));
+      if (flow === 'connect') {
+        sessionStorage.setItem('amb_phantom_pk', params.get('phantom_encryption_public_key'));
+        var sharedSecret = nacl.box.before(phantomPk, dappKp.secretKey);
+        dlSession = { sharedSecret: sharedSecret, session: payload.session };
+        fromPubkey = new solanaWeb3.PublicKey(payload.public_key);
+        await afterConnect('Phantom (deeplink)');
+      } else if (flow === 'sign') {
+        var pending = JSON.parse(sessionStorage.getItem('amb_pending') || '{}');
+        var signedTx = solanaWeb3.Transaction.from(b58decode(payload.transaction));
+        await broadcastSigned(signedTx, pending.blockhash, pending.lastValidBlockHeight);
+      } else {
+        setStatus('Unknown return. Please connect again.', true);
+      }
+    } catch (e) {
+      setStatus('Could not handle the Phantom return: ' + (e && e.message ? e.message : e), true);
+    }
+  }
+
+  // ---------- init ----------
+  function init() {
+    connection = new solanaWeb3.Connection(RPC_URL, 'confirmed');
+    $('connectBtn').addEventListener('click', onConnect);
+    $('sendBtn').addEventListener('click', onSend);
+    $('toInput').addEventListener('input', updateSendState);
+    $('amountInput').addEventListener('input', updateSendState);
+    if (window.solana && window.solana.isPhantom) {
+      setStatus('Phantom detected in this browser. Tap Connect Phantom.');
+    } else {
+      setStatus('No Phantom found in this browser. Open this page inside your Phantom app\'s browser, or tap Connect to open the Phantom app.');
+    }
+    var params = new URLSearchParams(window.location.search);
+    if (params.has('phantom_encryption_public_key') && params.has('nonce') && params.has('data')) {
+      handleDeeplinkReturn(params).then(function () {
+        try { history.replaceState({}, '', window.location.pathname); } catch (e) { /* ignore */ }
+      });
+      return;
+    }
+    updateSendState();
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
+  }
+})();
+</script>
+</body>
+</html>
