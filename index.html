@@ -212,8 +212,20 @@
         'To: <code>' + toStr + '</code><br>' +
         'Amount: ' + amountAmb + ' AMB (' + lamports.toLocaleString() + ' lamports). Fee is about 0.000005 AMB.';
       if (injectedProvider) {
-        setStatus('Waiting for your signature in Phantom…');
-        var signed = await injectedProvider.signTransaction(tx);
+        setStatus('Checking Phantom is still connected, then waiting for your signature…');
+        try { await injectedProvider.connect(); } catch (e) { /* already connected is fine */ }
+        var signed;
+        try {
+          signed = await injectedProvider.signTransaction(tx);
+        } catch (e) {
+          var msg = (e && e.message) ? e.message : String(e);
+          if (msg.indexOf('not been authorized') !== -1 || (e && e.code === 4100)) {
+            setStatus('Phantom says this site is not authorized to sign yet. Tap Connect Phantom again, approve it in Phantom, then tap Sign & send.', true);
+          } else {
+            setStatus('Could not send: ' + msg, true);
+          }
+          return;
+        }
         await broadcastSigned(signed, latest.blockhash, latest.lastValidBlockHeight);
       } else if (dlSession) {
         var serialized = tx.serialize({ requireAllSignatures: false });
